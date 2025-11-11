@@ -1,0 +1,265 @@
+name: Migrar para .NET 8 (ins-sls-cartaazul-bussiness-process-manager)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        # Clona o repo no runner (necessário antes de criar/alterar arquivos)
+
+      - name: Setup .NET SDK 8.0.x
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: '8.0.x'
+        # Prepara o CLI do .NET 8
+
+      - name: Criar solução e projetos (.NET 8)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ROOT="ins-sls-cartaazul-bussiness-process-manager"
+          SRC="$ROOT/src"
+
+          mkdir -p "$SRC"
+          cd "$SRC"
+
+          # 1) Criar solução e projetos base (UI MVC + classlibs)
+          dotnet new sln -n ins-sls-cartaazul-bussiness-process-manager
+          dotnet new mvc       -n Manager.UI -f net8.0
+          dotnet new classlib  -n Business   -f net8.0
+          dotnet new classlib  -n DAL        -f net8.0
+          dotnet new classlib  -n DTO        -f net8.0
+
+          # 2) Referências entre projetos
+          dotnet sln add Manager.UI/Manager.UI.csproj Business/Business.csproj DAL/DAL.csproj DTO/DTO.csproj
+          dotnet add Manager.UI/Manager.UI.csproj reference Business/Business.csproj DAL/DAL.csproj DTO/DTO.csproj
+          dotnet add DAL/DAL.csproj        reference DTO/DTO.csproj
+          dotnet add Business/Business.csproj reference DTO/DTO.csproj DAL/DAL.csproj
+
+          # 3) Pacotes necessários
+          dotnet add Manager.UI package Microsoft.Data.SqlClient --version 5.2.0
+          dotnet add DAL        package Microsoft.Data.SqlClient --version 5.2.0
+          dotnet add DAL        package Microsoft.Extensions.Configuration.Abstractions --version 8.0.0
+
+          # 4) Estruturas de pastas
+          mkdir -p DTO/Models DAL/Infrastructure Manager.UI/Views/Home
+
+          # 5) Código-fonte (DTO/DAL/Business/UI)
+          cat > DTO/Models/Area.cs <<'CS'
+          namespace DTO.Models
+          {
+              public class Area
+              {
+                  public int Id { get; set; }
+                  public string Nome { get; set; } = string.Empty;
+              }
+          }
+          CS
+
+          cat > DAL/Infrastructure/SqlConnectionFactory.cs <<'CS'
+          using Microsoft.Data.SqlClient;
+          using Microsoft.Extensions.Configuration;
+          using System.Data;
+
+          namespace DAL.Infrastructure
+          {
+              public interface IDbConnectionFactory
+              {
+                  IDbConnection Create();
+              }
+
+              public sealed class SqlConnectionFactory : IDbConnectionFactory
+              {
+                  private readonly string _connectionString;
+                  public SqlConnectionFactory(IConfiguration configuration)
+                  {
+                      // Lê "sompo" do appsettings.json
+                      _connectionString = configuration.GetConnectionString("sompo")
+                          ?? throw new InvalidOperationException("ConnectionStrings:sompo não encontrada no appsettings.json");
+                  }
+                  public IDbConnection Create() => new SqlConnection(_connectionString);
+              }
+          }
+          CS
+
+          cat > DAL/AreaDAL.cs <<'CS'
+          using DTO.Models;
+          using DAL.Infrastructure;
+          using System.Data;
+
+          namespace DAL
+          {
+              public class AreaDAL
+              {
+                  private readonly IDbConnectionFactory _factory;
+                  public AreaDAL(IDbConnectionFactory factory) => _factory = factory;
+
+                  public List<Area> List(Area filter)
+                  {
+                      var result = new List<Area>();
+                      using var conn = _factory.Create();
+                      using var cmd = conn.CreateCommand();
+                      cmd.CommandText = "SELECT TOP 50 Id, Nome FROM Area ORDER BY Id"; // ajuste conforme seu schema
+                      if (conn.State != ConnectionState.Open) conn.Open();
+                      using var rdr = cmd.ExecuteReader();
+                      while (rdr.Read())
+                      {
+                          result.Add(new Area
+                          {
+                              Id = rdr.GetInt32(0),
+                              Nome = rdr.IsDBNull(1) ? string.Empty : rdr.GetString(1)
+                          });
+                      }
+                      return result;
+                  }
+              }
+          }
+          CS
+
+          cat > Business/Services.AreaBusiness.cs <<'CS'
+          using DAL;
+          using DTO.Models;
+
+          namespace Business.Services
+          {
+              public class AreaBusiness
+              {
+                  private readonly AreaDAL _dal;
+                  public AreaBusiness(AreaDAL dal) => _dal = dal;
+                  public List<Area> List(Area area) => _dal.List(area);
+              }
+          }
+          CS
+
+          cat > Manager.UI/ServiceCollectionExtensions.cs <<'CS'
+          using Business.Services;
+          using DAL;
+          using Microsoft.Extensions.DependencyInjection;
+
+          namespace Manager.UI
+          {
+              public static class ServiceCollectionExtensions
+              {
+                  public static IServiceCollection AddAppServices(this IServiceCollection services)
+                  {
+                      services.AddScoped<AreaDAL>();
+                      services.AddScoped<AreaBusiness>();
+                      return services;
+                  }
+              }
+          }
+          CS
+
+          # Program.cs com using do namespace da extensão
+          cat > Manager.UI/Program.cs <<'CS'
+          using DAL.Infrastructure;
+          using Manager.UI;
+
+          var builder = WebApplication.CreateBuilder(args);
+
+          builder.Services.AddControllersWithViews();
+          builder.Services.AddAppServices();
+          builder.Services.AddScoped<IDbConnectionFactory, SqlConnectionFactory>();
+
+          var app = builder.Build();
+
+          if (!app.Environment.IsDevelopment())
+          {
+              app.UseExceptionHandler("/Home/Error");
+              app.UseHsts();
+          }
+
+          app.UseHttpsRedirection();
+          app.UseStaticFiles();
+          app.UseRouting();
+          app.UseAuthorization();
+
+          app.MapControllerRoute(
+              name: "default",
+              pattern: "{controller=Home}/{action=Index}/{id?}");
+
+          app.Run();
+          CS
+
+          cat > Manager.UI/Controllers/HomeController.cs <<'CS'
+          using Microsoft.AspNetCore.Mvc;
+          using Business.Services;
+
+          namespace Manager.UI.Controllers
+          {
+              public class HomeController(AreaBusiness areaBusiness) : Controller
+              {
+                  private readonly AreaBusiness _areaBusiness = areaBusiness;
+
+                  public IActionResult Index()
+                  {
+                      var areas = _areaBusiness.List(new DTO.Models.Area());
+                      return View(areas);
+                  }
+              }
+          }
+          CS
+
+          cat > Manager.UI/Views/Home/Index.cshtml <<'CSHTML'
+          @model IEnumerable<DTO.Models.Area>
+          @{
+              ViewData["Title"] = "Início";
+          }
+          <h1>Migração para .NET 8 (skeleton)</h1>
+          <p>ConnectionStrings:sompo está em <code>appsettings.json</code>.</p>
+          @if (Model != null)
+          {
+              <ul>
+              @foreach (var a in Model)
+              {
+                  <li>@a.Id - @a.Nome</li>
+              }
+              </ul>
+          }
+          CSHTML
+
+          # 6) appsettings.json com a connection string "sompo" EXATA que você enviou
+          #    (INSEGURA para produção; preferível usar Secrets/variáveis por ambiente)
+          cat > Manager.UI/appsettings.json <<'JSON'
+          {
+            "ConnectionStrings": {
+              "sompo": "Server=HDIWSQL19HAF.hdi.br;Database=CotadorCartaAzul;User Id=ccas_cotdh;Password=2y#h@q#MeE2dt@;MultipleActiveResultSets=true;Application Name=ins-sls-cartaazul-bussiness-process-manager;"
+            },
+            "Logging": {
+              "LogLevel": {
+                "Default": "Information",
+                "Microsoft.AspNetCore": "Warning"
+              }
+            },
+            "AllowedHosts": "*"
+          }
+          JSON
+
+          # 7) Build para validar
+          dotnet build -c Release
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v7
+        with:
+          commit-message: "Migração: base .NET 8 + ConnectionStrings:sompo"
+          branch: feature/migracao-dotnet8
+          title: "Migração para .NET 8 (base) — ins-sls-cartaazul-bussiness-process-manager"
+          body: |
+            Este PR adiciona a solução .NET 8 (ASP.NET Core MVC) baseada em `ins-sls-cartaazul-bussiness-process-manager`, com:
+            - ConnectionStrings **sompo** (conforme solicitado)
+            - DI e *factory* de conexão (Microsoft.Data.SqlClient)
+            - Camadas **UI/Business/DAL/DTO**
+            - Exemplo funcional `AreaBusiness` ↔ `AreaDAL` + Home/Index
+            - Build de validação (Release)
+
+            ⚠️ Recomenda-se mover a connection string para GitHub Secrets/variáveis por ambiente em PR futuro.
